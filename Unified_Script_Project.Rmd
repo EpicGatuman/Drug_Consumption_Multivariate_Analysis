@@ -1,0 +1,2045 @@
+---
+title: "Projecte_AD"
+author: "Roger Velilla, Jordi Ferré, Matías Mora"
+date: "2025-06-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+We've included a new code of preprocess before every section sice we were having several problems of execution
+
+
+Libraries we need:
+
+```{r}
+
+
+install.packages(c("dplyr", "ggplot2", "tidyr", "scales", "corrplot", "cluster", 
+                   "gridExtra", "MASS", "FactoMineR", "factoextra", "purrr", 
+                   "tibble", "mclust", "knitr", "vcd", "e1071", "caret", 
+                   "caTools", "DescTools", "biotools", "klaR","future","readr","plotly"))
+
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(tidyr)
+library(scales)
+library(corrplot)
+library(cluster)
+library(gridExtra)
+library(MASS)        
+library(FactoMineR)
+library(factoextra)
+library(purrr)
+library(tibble)
+library(mclust)      # ARI
+if (!"knitr" %in% loadedNamespaces()) library(knitr)
+library(vcd)
+library(e1071)       # naiveBayes
+library(caret)       # confusionMatrix
+library(caTools)     # sample.split
+library(DescTools)   # Conf
+library(biotools)    # boxM
+library(klaR)        # partimat
+
+```
+
+
+# Preprocessing
+Let's start the preprocess of our data. Firstly, we're going to observe the structure of our data.
+
+```{r}
+set.seed("123")
+
+
+df <- read_csv("Drug_Consumption.csv", show_col_types = FALSE)
+
+str(df)
+summary(df)
+
+```
+
+We can eliminate  the column ID, since it's not informative. We're going to convert our categorical variables to factors.
+
+```{r}
+
+df$ID <- NULL
+
+df[] <- lapply(df, function(x) if(is.character(x)) as.factor(x) else x)
+
+
+sapply(df, class)
+head(df)
+```
+
+Let's find if there's missing values in numerical variables:
+
+```{r}
+
+colSums(is.na(df))
+
+sapply(df[, sapply(df, is.numeric)], function(x) sum(x == 0))
+```
+
+Let's now check the normality of our data.
+
+```{r}
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+par(mfrow = c(2, 4))
+for (v in num_vars) {
+  hist(df[[v]], main = v, xlab = "", col = "skyblue")
+}
+par(mfrow = c(1, 1))
+
+shapiro_results <- lapply(num_vars, function(var) {
+  result <- shapiro.test(df[[var]])
+  data.frame(variable = var, W = result$statistic, p_value = result$p.value)
+})
+
+shapiro_df <- do.call(rbind, shapiro_results)
+print(shapiro_df)
+```
+Although shapiro Wilk test is negative for the majority of our data, except for  2 or 3 variables, we observe a quite gaussian distribution for each one.
+
+Let's check if applying Box-Cox helps achieving a more normal distribution in our numerical data.
+
+We first need to make it positive (log could not work otherwise)
+
+```{r}
+
+datos <- df
+num_vars <- names(datos)[sapply(datos, is.numeric)]
+datos_bc <- datos
+
+for (i in seq_along(num_vars)) {
+  var <- num_vars[i]
+  x <- datos[[var]]
+
+  if (min(x, na.rm=TRUE) <= 0) {
+    shift <- abs(min(x, na.rm=TRUE)) + 1e-6
+    x <- x + shift
+    cat("Variable", var, "shifted by", round(shift, 3), "to be positive for Box-Cox\n")
+  }
+
+  bc <- boxcox(lm(x ~ 1), plotit = FALSE)
+  lambda <- bc$x[which.max(bc$y)]
+  if (abs(lambda) < 1e-6) {
+    datos_bc[[var]] <- log(x)
+  } else {
+    datos_bc[[var]] <- (x^lambda - 1) / lambda
+  }
+  cat("Variable:", var, "  Lambda óptimo:", round(lambda, 3), "\n")
+}
+```
+
+Let's check if it has helped
+
+```{r}
+
+shapiro_results_bc <- lapply(num_vars, function(var) {
+  result <- shapiro.test(datos_bc[[var]])
+  data.frame(variable = var, W = result$statistic, p_value = result$p.value)
+})
+
+shapiro_df_bc <- do.call(rbind, shapiro_results_bc)
+print(shapiro_df_bc)
+
+par(mfrow = c(2, 4))
+for (var in num_vars) {
+  hist(datos_bc[[var]],
+       main = paste("Histograma Box-Cox de", var),
+       xlab = var,
+       col = "skyblue",
+       border = "white")
+}
+par(mfrow = c(1, 1))
+
+```
+
+As we can see, it hasn't really helped.
+
+
+Let's now check the outliers, with the z statistic.
+
+
+```{r outlier_zscore, message=FALSE, warning=FALSE}
+
+
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+
+z_mat <- scale(df[cont_vars])               # centra y escala
+z_abs <- abs(z_mat)                         # valor absoluto
+
+outlier_mask <- apply(z_abs, 1, function(r) any(r > 3))
+cat("Filas detectadas como outliers (|z|>3):", sum(outlier_mask), "\n")
+
+df_outliers <- df[!outlier_mask, ]            # dataset limpio
+cat("Shape sin outliers:", dim(df_outliers)[1], "×", dim(df_outliers)[2], "\n")
+
+
+
+shapiro_df <- lapply(cont_vars, function(v) {
+  s <- shapiro.test(df_outliers[[v]])
+  data.frame(variable = v,
+             W        = round(s$statistic, 3),
+             p_value  = round(s$p.value, 4))
+}) |> bind_rows()
+
+knitr::kable(shapiro_df, caption = "Shapiro–Wilk test after z-score outlier removal")
+
+par(mfrow = c(2, 4))  # 2 filas, 4 columnas
+
+for (var in cont_vars) {
+  hist(df_outliers[[var]],
+       main = paste("Histograma de", var),
+       xlab = var,
+       col = "skyblue",
+       border = "white")
+}
+
+par(mfrow = c(1, 1))  # Restaurar layout por defecto
+
+
+```
+
+There's not really a big statistical difference, at it may be seen, but we're going to eliminate the 30 outliers because it may have an impact on plots.
+
+
+```{r}
+df <- df_outliers
+```
+
+
+
+Theres a ficticious drug in the dataset, which was included in order to detect fraudulent responses to the survey. Let's eliminate the column and the rows of the people who has tested positive for it.
+
+
+```{r}
+
+# Keep only rows where Semer == "CL0"
+df <- df[df$Semer == "CL0", ]
+
+# Drop the Semer column
+df$Semer <- NULL
+
+```
+
+
+Since there's too many categories for each drug, and it would be really difficult to interpret much categories together, let's divide the data in groups. Strong drugs (non-legal ones) which there's a lot of people who has never consumed, has been divided in: Never used, used less than one month ago, used more than a month ago.
+For more common ones, such as caffeine, Alcohol, or Nicotine, it has been divided in: Last day, a month ago, More than a month ago. This redistribution has been selected because doing a prior exploratory analysis, there's a big imbalance (which we want to correct a little).
+
+```{r}
+# Vector with drug variable names
+drug_vars <- c("Alcohol", "Amphet", "Amyl", "Benzos", "Caff", "Cannabis", "Choc", "Coke", "Crack",
+               "Ecstasy", "Heroin", "Ketamine", "Legalh", "LSD", "Meth", "Mushrooms", 
+               "Nicotine", "VSA")
+
+
+# Substances with frequent use pattern
+frequent_use <- c("Caff", "Alcohol", "Nicotine")
+
+# Recoding function
+recode_use <- function(value, frequent = FALSE) {
+  if (is.na(value) || !grepl("^CL[0-6]$", value)) {
+    return(NA_character_)
+  }
+  cl <- as.integer(substr(value, 3, 3))
+  if (frequent) {
+    if (cl == 6) {
+      return("Last day")
+    } else if (cl %in% c(4, 5)) {
+      return("Last month")
+    } else {
+      return("More than a month ago")
+    }
+  } else {
+    if (cl %in% c(4, 5, 6)) {
+      return("Recent")
+    } else if (cl == 0) {
+      return("Never")
+    } else {
+      return("More than a month ago")
+    }
+  }
+}
+
+# Apply recoding and ensure factor type
+for (var in drug_vars) {
+  df[[var]] <- as.factor(vapply(df[[var]], recode_use, character(1), frequent = (var %in% frequent_use)))
+}
+
+str(df)
+
+```
+
+
+Education has many categories as well. We're going to divide it in: Compulsory studies, Advanced Studies, no studies.
+
+```{r}
+df$Education <- dplyr::case_when(
+  df$Education %in% c("Left school before 16 years","Left school at 16 years",
+                      "Left school at 17 years",
+                      "Left school at 18 years") ~ "No studies",
+  df$Education %in% c(
+                      "Some college or university, no certificate or degree",
+                      "Professional certificate/ diploma") ~ "Compulsory studies",
+  df$Education %in% c("University degree",
+                      "Masters degree",
+                      "Doctorate degree") ~ "Advanced studies"
+)
+
+df$Education <- factor(df$Education,
+                       levels = c("No studies", "Compulsory studies", "Advanced studies"))
+
+
+```
+
+
+
+
+DESCRIPTIVE ANALYSIS
+
+```{r}
+
+corrplot(cor(df[, num_vars], use="pairwise"))
+
+```
+
+Strong positive correlations:
+
+AScore and Cscore are highly correlated, suggesting a link between agreeableness and conscientious behavior.
+
+Impulsive and SS also show a strong positive correlation, indicating that individuals who score high in impulsivity tend to exhibit higher levels of sensation seeking.
+
+Oscore is positively correlated with SS, aligning with the idea that open individuals are more likely to seek novel experiences.
+
+Strong negative correlations:
+
+Nscore negatively correlates with both Escore and Cscore, which suggests that more neurotic individuals tend to be less extraverted and less conscientious.
+
+Cscore and SS show a negative association, implying that conscientious individuals are less inclined to seek high-stimulation or risky experiences.
+
+Weak or negligible correlations:
+
+Variables such as Impulsive and AScore, or Impulsive and Escore, display minimal correlation, suggesting that impulsivity is relatively independent from these personality dimensions in this sample.
+
+This correlations will be further used in order to interpret PCA.
+
+```{r}
+
+cat_vars <- names(df)[sapply(df, is.factor)]
+print(cat_vars)
+
+plots_per_page <- 4
+
+if (length(cat_vars) > 0) {
+  for (i in seq(1, length(cat_vars), by = plots_per_page)) {
+    plot_list <- list()
+    for (j in i:min(i + plots_per_page - 1, length(cat_vars))) {
+      v <- cat_vars[j]
+      plot_data <- df %>%
+        group_by(!!sym(v)) %>%
+        summarise(n = n()) %>%
+        mutate(perc = 100 * n / sum(n))
+      p <- ggplot(plot_data, aes_string(x = v, y = "perc", fill = v)) +
+        geom_bar(stat = "identity", color = "black") +
+        labs(title = paste("Distribución de clases:", v),
+             y = "Porcentaje (%)",
+             x = v) +
+        theme_minimal() +
+        theme(legend.position = "none",
+              axis.text.x = element_text(angle = 45, hjust = 1))
+      plot_list[[length(plot_list) + 1]] <- p
+    }
+    do.call(gridExtra::grid.arrange, c(plot_list, ncol = 2))
+  }
+} else {
+  print("No hay variables categóricas encontradas.")
+}
+
+```
+
+For nearly all the analyzed substances, the majority of individuals report no recent use, resulting in a heavily skewed distribution toward non-consumption. This imbalance is particularly pronounced for most drugs, except for caffeine, chocolate, and nicotine, where usage is more evenly spread across multiple categories.
+
+Among the sociodemographic variables, the most frequent age group is 25–34 years, the predominant country is the United Kingdom, the most common education level is "Some college or university, no certificate or degree", and the most represented ethnicity is White. In contrast, gender is relatively balanced, with nearly equal proportions of male and female participants.
+
+Overall, the dataset exhibits significant class imbalance in most categorical features, especially those related to substance use. This should be taken into account in the interpretation and modeling of subsequent analyses. Although we did it for drugs, sociological variables won't be redistributed, as it wouldn't make sense
+
+
+
+Since the drug repository has too much drugs, and some of them aren't popular nor interesting to interpret,  and moreover there's a big unbalance on the variables we're suppressing, we are going to reduce our drug dataframe. We're going to take the most "famous" ones.
+
+```{r}
+drug_vars <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy"
+                    , "Heroin","Amphet","Benzos")
+
+demo_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+df_subset <- df[, c(num_vars, demo_vars, drug_vars)]
+
+str(df_subset)
+summary(df_subset)
+
+``` 
+
+# PCA 
+
+
+
+First, let's get the data.
+
+
+```{r}
+
+df_pca <- df_subset[, num_vars]
+
+pca_res <- PCA(df_pca, scale.unit = TRUE,graph=F)
+
+plot(pca_res, choix = "ind")   
+plot(pca_res, choix = "var")  
+
+# Scree plot 
+fviz_eig <- function(res) {
+  eig <- res$eig
+  qplot(1:nrow(eig), eig[, 2], geom = "line") +
+    geom_point() +
+    labs(x = "Principal Component ", y = "% Explained Variance",
+         title = "Scree Plot")
+}
+fviz_eig(pca_res)
+
+
+var_explained <- pca_res$eig[, 2]         
+cum_var <- cumsum(var_explained)           
+
+#nº components until reaching 70% of variance
+n_components_70 <- which(cum_var >= 70)[1]
+
+cat("Number of principal components needed to explain at least 70% of variance:", n_components_70, "\n")
+cat("Variance explained by these components:", cum_var[n_components_70], "%\n")
+
+print(data.frame(PC=1:length(var_explained), 
+                 Var_Explained=var_explained, 
+                 CumVar_Explained=cum_var))
+
+```
+
+```{r}
+
+head(pca_res$ind$coord)
+
+print(pca_res$var$coord)
+
+``` 
+
+Dimension 1 (32.1% of the variance) shows strong positive loadings for Impulsive (0.79), SS – Sensation Seeking (0.75), Nscore – Neuroticism (0.48), and Oscore – Openness to Experience (0.43), and strong negative loadings for Cscore – Conscientiousness (-0.64) and AScore – Agreeableness (-0.48). The loading of Escore – Extraversion is negligible (-0.10).
+
+This dimension can be interpreted as an axis contrasting individuals who are impulsive, emotionally reactive, sensation-seeking, and open to experience (positive scores) against those who are responsible, organized, and prosocial (negative scores). It reflects a polarity between novelty-seeking, disinhibition, and emotional vulnerability versus self-control, conscientiousness, and agreeableness.
+
+Dimension 2 (26.0% of the variance) is dominated by Escore – Extraversion (0.82), followed by Oscore (0.54), SS (0.44), Cscore (0.41), and AScore (0.28). Nscore presents a moderate negative loading (-0.59).
+
+This dimension seems to capture differences between individuals who are sociable, open-minded, energetic, and creative (positive scores), and those who are more anxious, emotionally unstable, or introverted (negative scores).
+
+Dimension 3 (13.5% of the variance) is mainly defined by AScore – Agreeableness (0.72), followed by Oscore (0.45) and Nscore (0.31). The rest of the variables contribute minimally.
+
+This third component appears to distinguish individuals who are cooperative, empathetic, and intellectually open from those who are more distant, rigid, or less prosocial.
+
+In summary, Dimension 1 contrasts impulsivity and novelty-seeking with responsibility and prosociality; Dimension 2 opposes sociability and creativity to emotional instability; and Dimension 3 reflects a continuum from empathy and openness to emotional detachment and inflexibility.
+
+
+
+The plots will reinforce our interpretation:
+```{r}
+fviz_pca_var(pca_res, axes = c(1, 2),
+             title = "Variables: Dim 1 vs Dim 2")
+
+fviz_pca_var(pca_res, axes = c(1, 3),
+             title = "Variables: Dim 1 vs Dim 3")
+```
+The correlation circle plots offer a complementary view of the component structure.
+
+In the Dim1 vs Dim2 plot, Impulsive, SS, and Oscore are tightly clustered in the positive direction of Dim1, indicating a shared underlying trait linked to novelty-seeking and openness. Cscore and AScore are clearly opposed to this cluster, reinforcing the interpretation of Dim1 as a contrast between disinhibition and self-regulation. Dim2 is dominated by Escore, pointing strongly upward, while Nscore points downward, confirming this dimension as a sociability vs. neuroticism axis.
+
+In the Dim1 vs Dim3 plot, AScore shows a clear alignment with Dim3, suggesting that this component isolates agreeableness. Cscore remains negatively aligned with Dim1 and shows low contribution to Dim3. Oscore projects moderately onto both dimensions, indicating its involvement in broader personality variance. Impulsive and SS continue to define the positive direction of Dim1.
+
+These maps confirm that Dim1 captures a core disinhibitory dimension, Dim2 reflects emotional and social orientation, and Dim3 isolates interpersonal warmth.
+
+
+
+```{r}
+
+loadings <- as.data.frame(pca_res$var$coord)
+colnames(loadings)[1:3] <- c("Dim1", "Dim2", "Dim3")
+loadings$Variable <- rownames(loadings)
+
+origin <- data.frame(Dim1=rep(0, nrow(loadings)), 
+                     Dim2=rep(0, nrow(loadings)), 
+                     Dim3=rep(0, nrow(loadings)), 
+                     Variable=loadings$Variable)
+
+p <- plot_ly()
+
+for(i in 1:nrow(loadings)) {
+  p <- add_trace(p,
+                 x = c(0, loadings$Dim1[i]),
+                 y = c(0, loadings$Dim2[i]),
+                 z = c(0, loadings$Dim3[i]),
+                 type = 'scatter3d',
+                 mode = 'lines+markers+text',
+                 text = list('', loadings$Variable[i]),
+                 textposition = "top",
+                 line = list(width = 5),
+                 marker = list(size = 2),
+                 name = loadings$Variable[i],
+                 showlegend = FALSE)
+}
+
+p <- layout(p,
+            title = "Círculo de correlaciones (Variables en PCA 3D)",
+            scene = list(
+              xaxis = list(title = "Dim 1"),
+              yaxis = list(title = "Dim 2"),
+              zaxis = list(title = "Dim 3")
+            ))
+p
+
+```
+
+The 3D correlation plot provides a clear visual confirmation of the structure previously identified in the PCA. The first three dimensions together explain approximately 70% of the total variance, making this projection a reliable summary of the main relationships among the variables.
+
+Notably, SS (Sensation Seeking) and Impulsive appear very close to each other, both in direction and orientation, indicating a strong positive correlation. This spatial proximity reinforces the idea that these two variables share a common psychological core related to disinhibition and novelty-seeking.
+
+AScore (Agreeableness) stands out along Dimension 3, confirming that this component isolates prosocial and cooperative traits. Cscore and Escore also occupy distinct regions in the space, aligning with their roles in self-regulation and social energy, respectively. Meanwhile, Nscore and Oscore show moderate contributions, spreading across multiple dimensions.
+
+Overall, the 3D plot coherently reflects the axes of psychological variation already discussed: impulsivity vs. control (Dim1), sociability vs. neuroticism (Dim2), and empathy vs. detachment (Dim3).
+
+
+We'll now do the core of our analysis, which is seeing how PCA behaves with supplementary variables. We'll plot for each category the PCA dimension plots. We will do it with dimension 1 and 2. To plot, we're going to select a subset of 1000 samples, for simplicity's sake.
+
+
+```{r}
+cat_vars <- c(drug_vars, "Gender", "Ethnicity", "Country", "Education", "Age")
+
+
+
+num_vars <- names(df_subset)[sapply(df_subset, is.numeric)]
+pca_res <- PCA(df_subset[, num_vars], scale.unit = TRUE, ncp = 5, graph = FALSE)
+
+coords <- as.data.frame(pca_res$ind$coord[, 1:2])  # Dim.1 y Dim.2
+
+for (var in cat_vars) {
+  # Combinar coordenadas y variable categórica
+  coords_plot <- data.frame(coords, group = df_subset[[var]])
+  
+  # Plot
+  p <- ggplot(data = coords_plot, aes(x = Dim.1, y = Dim.2, color = group)) +
+    geom_point(size = 2) +
+    labs(title = paste("PCA (Dim 1 vs 2) - Colored by", var),
+         x = "Dim 1", y = "Dim 2", color = var) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"))
+  
+  print(p)
+}
+
+```
+
+## Relationship Between Personality Traits and Drug Use: PCA Insights
+
+We conducted a Principal Component Analysis (PCA) using seven continuous psychological variables: **Neuroticism (Nscore)**, **Extraversion (Escore)**, **Openness (Oscore)**, **Agreeableness (AScore)**, **Conscientiousness (Cscore)**, **Impulsivity**, and **Sensation Seeking (SS)**.
+
+Our goal was to identify latent personality dimensions and explore how these dimensions relate to patterns of drug use and sociodemographic categories.
+
+---
+
+### Projection of Categorical Variables
+
+We examined the relationship between PCA dimensions and several **categorical variables**: drug consumption levels (e.g., **cannabis, cocaine, heroin, amphetamines**) and **sociodemographics** (e.g., **age**, **education**).
+
+#### Key Observation:
+
+- There is a **clear separation along Dimension 1** for several **strong or illegal drugs**. Individuals with **recent or frequent use** of substances like **cocaine, amphetamines, or cannabis** consistently appear on the **positive side** of Dimension 1. This suggests that the **psychological profile captured by Dimension 1 — impulsivity, emotional instability, and sensation seeking — is strongly associated with higher drug use**.
+
+- In contrast, **Dimension 2 does not show meaningful differences** across levels of drug use or any of the sociodemographic categories. The distribution of individuals across Dimension 2 is **comparatively homogeneous**, indicating **no clear link** between this axis and substance use behavior.
+
+
+
+We will now do 3d plots (instead of dim 1 vs dim 3).
+
+
+
+```{r}
+var_expl <- round(pca_res$eig[1:3, 2], 1)
+
+x_lab <- paste0("Dim 1 (", var_expl[1], "%)")
+y_lab <- paste0("Dim 2 (", var_expl[2], "%)")
+z_lab <- paste0("Dim 3 (", var_expl[3], "%)")
+
+wanted <- c("Coke", "Gender", "Country", "Heroin", "Nicotine", "Education")
+
+df_subset[wanted] <- lapply(df_subset[wanted], as.factor)
+
+colnames(df_subset)[1:3] <- c("Dim1", "Dim2", "Dim3")
+
+set.seed(123)  # reproducible
+df_sample <- df_subset[sample(nrow(df_subset), 500), ]
+
+for (var in wanted) {
+  plot_ly(df_sample, 
+          x = ~Dim1, y = ~Dim2, z = ~Dim3,
+          color = df_sample[[var]],
+          colors = "Set1",
+          type = 'scatter3d',
+          mode = 'markers',
+          marker = list(size = 4)) %>%
+    layout(title = paste("PCA 3D Scatter by", var),
+           scene = list(
+             xaxis = list(title = x_lab),
+             yaxis = list(title = y_lab),
+             zaxis = list(title = z_lab)
+           )) %>%
+    print()
+}
+
+```
+We observe that the third dimension does not clearly separate any of the selected categorical variables. This suggests that there are no substantial differences, along the empathy–detachment axis captured by Dimension 3, in relation to strong drug use (e.g., heroin or cocaine), country of residence, gender, or education level.
+
+Dimension 3 reflects a continuum from empathy and openness to emotional detachment and inflexibility, but this psychological contrast does not appear to meaningfully differentiate the subgroups defined by these sociodemographic or consumption-related variables.
+
+#MDS
+
+
+```{r}
+
+
+drug_vars <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy"
+                    , "Heroin","Amphet","Benzos")
+
+soc_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+df_subset <- df[, c(num_vars, soc_vars, drug_vars)]
+
+```
+
+We will firstly apply a gower distance matrix and apply MDS. Since the importance of our dataset lies in the categorical variables, we won't consider metric MDS, since we find useless. We'll consider Sammon, isoMDS and cmdscale.
+
+
+```{r}
+
+num_vars <- names(df_subset)[sapply(df_subset, is.numeric)]
+df_subset_scaled <- df_subset
+df_subset_scaled[num_vars] <- scale(df_subset[num_vars])
+
+
+gower_dist <- daisy(df_subset_scaled, metric = "gower")
+
+
+```
+
+```{r}
+mds_res <- cmdscale(gower_dist, k = 2, eig = TRUE) #standard
+mds_coords <- as.data.frame(mds_res$points)
+colnames(mds_coords) <- c("Dim1", "Dim2")
+
+for (v in colnames(df_subset)) {
+  mds_coords[[v]] <- df_subset[[v]]
+}
+
+for (v in colnames(df_subset)) {
+  print(
+    ggplot(mds_coords, aes(x = Dim1, y = Dim2, color = .data[[v]])) +
+      geom_point(size = 2, alpha = 0.8) +
+      labs(title = paste("MDS (Dim 1 vs 2) - Colored by", v),
+           x = "Dim 1", y = "Dim 2", color = v) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  )
+}
+```
+
+The sociographic interpretation will be held later, but we can observe the following pattern.
+There's a big amount of observations in the left hand side of the plot, and through an easy inspection we can clearly see that it corresponds to people that, in general, has never taken any hard drugs. We can see that those people tend to have a higher Cscore (general Conscientiousness), and a lower impusliveness than the average of our data. We observe that USA is clearly on the right hand side, UK on the left one, so we find a relationship between: USA people, high impulsiveness and poor conscientiousness and drug consumption.
+
+```{r}
+eigenvalues <- mds_res$eig
+
+# Porcentaje de varianza explicada por cada dimensión
+var_exp <- 100 * eigenvalues / sum(eigenvalues)
+
+# Porcentaje acumulado
+cum_var_exp <- cumsum(var_exp)
+
+# Tabla resumen
+mds_dim_summary <- data.frame(
+  Dim = 1:length(eigenvalues),
+  Eigenvalue = eigenvalues,
+  Var_Explained = var_exp,
+  CumVar_Explained = cum_var_exp
+)
+
+print(head(mds_dim_summary, 10))  # Las 10 primeras dimensiones
+
+# Scree plot (opcional)
+
+eig_df <- data.frame(Dim = 1:length(eigenvalues), Eigenvalue = eigenvalues)
+ggplot(eig_df, aes(x = Dim, y = Eigenvalue)) +
+  geom_line() + geom_point() +
+  labs(title = "Scree plot (MDS)", x = "Dimensión", y = "Autovalor") +
+  theme_minimal()
+  
+
+```
+
+We observe that with 2 dimensions we have a pretty good insight of the data.
+### Sociodemographic Patterns in Drug Use (MDS Interpretation)
+
+To explore the relationship between sociodemographic variables and drug use, we applied classical multidimensional scaling (MDS) using the Gower distance, which accommodates both numerical and categorical variables. We included personality scores, drug usage indicators, and key sociodemographic factors such as gender, age, education, and country.
+
+By visualizing the MDS results colored by these variables, several meaningful patterns emerged:
+
+- **Country**: Despite having fewer individuals, respondents from the **USA** are clearly shifted toward the right-hand side of the MDS plot, a region associated with higher reported use of both major (e.g., heroin, ecstasy) and minor drugs (e.g., cannabis, nicotine). In contrast, participants from the **UK** and **Republic of Ireland** tend to cluster on the opposite side, where drug usage is noticeably lower.
+
+- **Gender**: A similar directional pattern is observed for **gender**. **Male** individuals appear more frequently on the right-hand side of the MDS space, overlapping with the areas associated with drug use, while **females** tend to cluster more on the left-hand side, which aligns with lower consumption levels. This suggests that **males may be more likely to engage in drug use across multiple substances**, from nicotine and cannabis to harder drugs.
+
+- **Drug Usage (Cannabis, Nicotine, Heroin)**: The clearest separation is visible when coloring the MDS plots by **drug use status**. For example, recent **cannabis** and **heroin** users are more prevalent on the **right side of the plot**, whereas non-users or those who haven't used recently are concentrated on the **left side**. This reinforces the interpretation that the **first MDS dimension reflects a general gradient of drug involvement**.
+
+Overall, the MDS visualization reveals a **strong sociodemographic component to drug use patterns**, with both **nationality and gender** being key differentiators. Individuals from the USA and males consistently occupy MDS regions associated with higher substance use, while participants from other countries and females are associated with lower levels of reported drug consumption.
+
+
+### Age Differences Along MDS Dimensions
+
+When examining the MDS configuration colored by **age group**, we observe a potential separation along **Dimension 2**. Specifically, younger individuals (e.g., the **18–24** group) tend to cluster in the **lower part** of the map (lower values of Dim 2), while older age groups, especially **45–54** and **55–64**, are more concentrated in the **upper region**. We also observe a study separation in the y axis (dimension 2), but it's clearly related to the age separation, since younger people has less studies.
+
+Although this trend is not perfectly sharp, the pattern suggests that **Dim 2 may partially reflect age-related differences**. However, it is important to note that the MDS was computed on a combination of **categorical sociodemographic variables** and **numerical personality scores**. Thus, the observed age gradient might also be influenced by underlying psychological traits (e.g., impulsivity, neuroticism, openness) that are correlated with age.
+
+In short, **Dim 2 seems to capture an age-related axis**, but its interpretation should be made with caution, as it is entangled with the numerical personality constructs also used to compute the Gower distance. A more precise decomposition would require separating the contribution of age from that of the psychological dimensions.
+
+
+
+Let's look at the sammon and Kruskal's method one (non metric MDS). We're going to look at the graphs that we've found interesting (differentiating through age, country, Coke), and see if there is significant differences.
+
+```{r}
+  
+gower_dist_mat <- as.matrix(gower_dist)
+gower_dist_sym <- as.dist(gower_dist_mat)
+sammon_res <- sammon(gower_dist_sym, k = 2)
+
+sammon_coords <- as.data.frame(sammon_res$points)
+colnames(sammon_coords) <- c("Dim1", "Dim2")
+
+for (v in c("Age","Country","Coke")) {
+  sammon_coords[[v]] <- df_subset[[v]]
+}
+
+for (v in c("Age","Country","Coke")) {
+  print(
+    ggplot(sammon_coords, aes(x = Dim1, y = Dim2, color = .data[[v]])) +
+      geom_point(size = 2, alpha = 0.8) +
+      labs(title = paste("Sammon Mapping - Colored by", v),
+           x = "Dim 1", y = "Dim 2", color = v) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  )
+}
+
+```
+#This takes a lot of time to compile! Uncomment
+```{r}
+
+#k <- 4
+#stress <- numeric(k)
+#for (i in 1:k) {
+# stress[i] <- isoMDS(gower_dist, k = i)$stress
+#}
+#plot(1:k, stress, type = "b", pch = 19,
+ #    xlab = "Number of Dimensions", ylab = "Stress",
+  #   main = "Stress vs Dimensions (isoMDS)")
+
+shep <- Shepard(gower_dist, sammon_res$points)
+plot(shep, pch = ".", main = "Shepard Diagram - isoMDS")
+lines(shep$x, shep$yf, type = "S", col = "blue")
+
+
+```
+
+There's no apparent difference between the cmdscale and Sammon's method. We think this is because the difference is more easily appreciated if  the mds is computed just with numerical variables (since there's no magnitude order with categories).
+
+The shepherd diagram is not that good, we'll stick to metric MDS for now. Let's try isoMDS.
+
+
+
+```{r}
+
+nmds_res <- isoMDS(gower_dist, k = 2)
+
+nmds_coords <- as.data.frame(nmds_res$points)
+colnames(nmds_coords) <- c("Dim1", "Dim2")
+
+for (v in c("Age","Country","Coke")) {
+  nmds_coords[[v]] <- df_subset[[v]]
+}
+
+
+for (v in c("Age", "Country", "Coke")) {
+  print(
+    ggplot(nmds_coords, aes(x = Dim1, y = Dim2, color = .data[[v]])) +
+      geom_point(size = 2, alpha = 0.8) +
+      labs(title = paste("isoMDS (Kruskal) - Colored by", v),
+           x = "Dim 1", y = "Dim 2", color = v) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  )
+}
+```
+There's no apparent difference between the cmdscale and Kragal's method. We think this is because the difference is more easily appreciated if  the mds is computed just with numerical variables (since there's no magnitude order with categories).
+
+
+#Takes a lot to compile!
+
+```{r}
+#k <- 4
+#stress <- numeric(k)
+#for (i in 1:k) {
+#  stress[i] <- isoMDS(gower_dist, k = i)$stress
+#}
+#plot(1:k, stress, type = "b", pch = 19,
+#     xlab = "Number of Dimensions", ylab = "Stress",
+#     main = "Stress vs Dimensions (isoMDS)")
+
+shep <- Shepard(gower_dist, nmds_res$points)
+plot(shep, pch = ".", main = "Shepard Diagram - isoMDS")
+lines(shep$x, shep$yf, type = "S", col = "blue")
+
+
+```
+The elbow is in 2, which tells us, again, that 2 dimensions is great. Again, Shepard tells us that we better stick to Metric MDS. We will just include metric
+
+
+# CA
+
+```{r}
+
+df <- read_csv("Drug_Consumption.csv")
+df$ID <- NULL
+df[] <- lapply(df, function(x) if(is.character(x)) as.factor(x) else x)
+
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+
+z_mat <- scale(df[cont_vars])               # centra y escala
+z_abs <- abs(z_mat)                         # valor absoluto
+
+outlier_mask <- apply(z_abs, 1, function(r) any(r > 3))
+df_outliers <- df[!outlier_mask, ]            # dataset limpio
+
+df<-df_outliers
+df <- df[df$Semer == "CL0", ]
+df$Semer <- NULL
+```
+
+```{r}
+
+
+df$Education <- dplyr::case_when(
+  df$Education %in% c("Left school before 16 years","Left school at 16 years",
+                      "Left school at 17 years",
+                      "Left school at 18 years") ~ "No studies",
+  df$Education %in% c(
+                      "Some college or university, no certificate or degree",
+                      "Professional certificate/ diploma") ~ "Compulsory studies",
+  df$Education %in% c("University degree",
+                      "Masters degree",
+                      "Doctorate degree") ~ "Advanced studies"
+)
+
+df$Education <- factor(df$Education,
+                       levels = c("No studies", "Compulsory studies", "Advanced studies"))
+
+```
+
+
+```{r}
+
+
+drug_vars <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy"
+                    , "Heroin","Amphet","Benzos")
+
+
+soc_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+df_subset <- df[, c(num_vars, soc_vars, drug_vars)]
+
+```
+
+We will firstly define the hard drugs (we exclude cannabis, since there's places where it's legal, alcohol, caffeine, chocolate):
+
+```{r}
+hard_drugs <- c("Amphet", "Amyl", "Benzos", "Coke", "Crack",
+                "Ecstasy", "Heroin", "Ketamine", "Legalh", "LSD", 
+                "Meth", "Mushrooms", "VSA")
+
+
+```
+
+Since we've already covered much of the relations, we've found interesting to study the relation of education and the consume of drugs. In order to do that, we're going to create an aritifical factor, which is: recent drug addict (recent in a hard drug), ex-drug consumer (more than 3 drugs before in your life), and the rest, which can be considered non-drug addicts nor ex-consumers.
+
+
+```{r}
+
+get_drug_status <- function(row) {
+  values <- row[hard_drugs]
+  cl_codes <- as.integer(substr(as.character(values), 3, 3))
+  
+  if (any(cl_codes == 6, na.rm = TRUE)) {
+    return("Used in Last Day")
+  } else if (any(cl_codes == 5, na.rm = TRUE)) {
+    return("Used in Last Week")
+  } else if (any(cl_codes == 4, na.rm = TRUE)) {
+    return("Used Last Month")
+  } 
+  else if (any(cl_codes == 3, na.rm = TRUE)) {
+    return("Used Last Year")
+  }
+  else if (any(cl_codes %in% c(2, 1), na.rm = TRUE)) {
+    return("Long Time Ago")
+  } else {
+    return("No Hard Drug Use")
+  }
+}
+
+df$drug_status <- apply(df, 1, get_drug_status)
+
+df$drug_status <- factor(df$drug_status, 
+                         levels = c("Used in Last Day", "Used in Last Week", 
+                                    "Used Last Month", "Used Last Year", 
+                                    "Long Time Ago", "No Hard Drug Use"),
+                         ordered = TRUE)
+
+table(df$drug_status)
+table(df$Education)
+```
+```{r}
+colnames(df)
+
+str(df$drug_status)
+tab <- table(df$Education, df$drug_status)
+
+res.ca <- CA(tab, graph = FALSE)
+
+res.ca$eig
+barplot(res.ca$eig[,2], main = "Eigenvalues", names.arg = 1:nrow(res.ca$eig))
+
+res.ca$row$coord      
+res.ca$row$contrib     
+res.ca$row$cos2       
+
+res.ca$col$coord
+res.ca$col$contrib
+res.ca$col$cos2
+
+
+plot.CA(res.ca)
+
+
+plot.CA(res.ca, invisible = "col")       
+plot.CA(res.ca, invisible = "row")       
+
+
+
+```
+We conducted a correspondence analysis (CA) to investigate the relationship between education level and hard drug use behavior, categorized into six ordered levels: Used in Last Day, Used in Last Week, Used Last Month, Used Last Year, Long Time Ago, and No Hard Drug Use.
+
+The CA map shows a dominant first dimension (Dim 1), which accounts for 93.96% of the total inertia, reflecting the main structure in the data.
+
+There is a clear gradient from low to high education levels in relation to drug use severity:
+
+Individuals with no studies are positioned closest to Used in Last Day and Used Last Week, indicating the highest levels of recent hard drug use.
+
+Those with compulsory studies are near Used Last Week and Used Last Month, suggesting moderate but still notable recent usage.
+
+Individuals with advanced studies cluster near No Hard Drug Use and Long Time Ago, showing a very low incidence of hard drug use, either never or discontinued long ago.
+
+This pattern suggests a strong inverse relationship between educational attainment and recent hard drug use: as education level increases, the likelihood of recent drug use significantly decreases.
+
+The second dimension (Dim 2), explaining only 6.04% of the variability, does not introduce a meaningful axis of interpretation in this case.
+
+Conclusion
+Education level is strongly associated with patterns of hard drug use. People with no education are much more likely to be recent users, those with compulsory education show moderate recent use, and those with advanced education report almost no recent use.
+
+To explore the association between educational attainment and patterns of hard drug use, we performed a correspondence analysis (CA) using the full set of original education categories provided in the dataset, without grouping or collapsing them.
+
+Hard drug use was categorized into six levels based on recency:
+Used in Last Day, Used in Last Week, Used Last Month, Used Last Year, Long Time Ago, and No Hard Drug Use.
+
+The CA factor map reveals a strong structure along the first dimension (Dim 1), which explains 90.62% of the total inertia, indicating that nearly all of the association between education and drug use can be interpreted along a single axis.
+
+On the left side of this axis, we observe that individuals with higher academic qualifications—such as University degree, Masters degree, and Doctorate degree—are closely aligned with No Hard Drug Use and Long Time Ago. This suggests that those with more advanced education are substantially less likely to report recent drug use.
+
+Conversely, the right side of Dim 1 features categories such as Used in Last Day, Used in Last Week, and Used Last Month in close proximity to educational levels like Left school at 17 years, Left school at 18 years, and Some college or university, no certificate or degree. This implies that individuals with lower or incomplete education tend to report more recent hard drug use.
+
+The second dimension (Dim 2), accounting for only 5.79% of the inertia, contributes minimally to the overall interpretation and does not reveal a distinct secondary structure.
+
+Conclusion
+This analysis, which retains the full granularity of the original education levels, confirms a clear and strong inverse relationship between educational attainment and hard drug use severity. Individuals with higher education show markedly lower levels of recent drug use, while those with lower education levels are more likely to engage in frequent or recent consumption.
+
+# MCA 
+
+
+```{r}
+
+
+drug_vars <- c("Amphet", "Coke", "Crack",
+               "Ecstasy", "Heroin", "Ketamine", "LSD", "Meth")
+
+
+soc_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+df_subset <- df[, c(num_vars, soc_vars, drug_vars)]
+
+```
+
+First, we're going to do the analysis with hard drugs, to see if there is a big difference.
+```{r}
+
+
+sup_vars <- c("Age","Gender","Country")
+
+
+df_mca <- df_subset
+cat_vars <- df_mca %>%
+  select(where(is.factor)) %>%
+  select(-all_of(soc_vars)) %>%
+  select_if(~ nlevels(.) > 1)
+
+mca_data <- bind_cols(cat_vars, df_mca[sup_vars])
+
+quali_sup_indices <- (ncol(cat_vars) + 1):(ncol(cat_vars) + length(sup_vars))
+
+res_mca <- MCA(mca_data, quali.sup = quali_sup_indices, graph = FALSE,level.ventil = 0.01)
+
+```
+
+```{r}
+fviz_screeplot(res_mca, addlabels = TRUE, ggtheme = theme_minimal()) +
+  labs(title = "MCA - Variance Explained by Dimensions")
+
+coord_vars <- as.data.frame(res_mca$var$coord)
+
+eig_vals <- res_mca$eig
+eig_vals$Cumulative <- cumsum(eig_vals[, 2])
+print(eig_vals)
+
+```
+
+We observe that, although having lots of variables, with the first two dimensions we may explain a quite good amount of the inertia.
+```{r}
+
+# Gráfico de categorías (solo activas)
+fviz_mca_var(res_mca, repel = TRUE, ggtheme = theme_minimal(),
+             col.var = "contrib",
+             gradient.cols = c("lightblue", "blue", "darkblue"),
+             title = "MCA - Categories")
+
+
+
+```
+### Interpretation of the MCA Plot - Categories
+
+The plot above shows the results of a Multiple Correspondence Analysis (MCA) applied to categorical variables related to drug consumption, age, and country of residence.
+
+**Dimension 1 (24.8%)** appears to separate **non-users** ("Never" categories) from all others. On the left side of the plot, we find categories such as `LSD_Never`, `Ecstasy_Never`, `Amphet_Never`, etc., corresponding to individuals who have **never used** these substances. On the right side, we see categories of people who **have used drugs**, either recently or more than a month ago.
+
+**Dimension 2 (12%)** seems to distinguish based on **recency of use**. Towards the **upper right** corner, we observe categories like `Crack_Recent`, `Heroin_Recent`, `Coke_Recent`, and `Ketamine_Recent`, clearly representing **recent use of hard drugs**. In contrast, categories such as `Coke_More than a month ago` or `Crack_More than a month ago` are located **lower right**, reflecting **past use**. Categories associated with **no drug use** are concentrated lower or to the left.
+
+Regarding **sociodemographic variables**, **European countries** (`UK`, `Republic of Ireland`) are much more in the left hand side than others like `Australia` and `Canada`, which are positioned more to the right, indicating a stronger association with strong drug use. Similarly, the **youngest age group** (`18-24`) is also on the right side of the plot, suggesting a higher tendency toward drug consumption compared to older groups (`45-54`, `55-64`), which are more central or to the left.
+
+In summary:
+
+- **Dim1** separates those who have **never used drugs** from those who **have used** at least once.
+- **Dim2** separates **recent users** from those who used drugs **in the past** or **never**.
+- The **upper right corner** contains categories for **recent use of hard drugs**.
+- The **left side** contains **non-user** categories.
+- The **lower right** shows people who used drugs **more than a month ago**.
+- **Younger individuals** and people from **America** tend to be more closely associated with drug use.
+
+```{r}
+fviz_mca_ind(res_mca,
+             label = "none",
+             habillage = df_mca$Gender,
+             addEllipses = TRUE,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             title = "MCA - Individuals Colored by Gender")
+fviz_mca_ind(res_mca,
+             label = "none",
+             habillage = df_mca$Coke,
+             addEllipses = TRUE,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             title = "MCA - Individuals Colored by Coke")
+fviz_mca_ind(res_mca,
+             label = "none",
+             habillage = df_mca$Age,
+             addEllipses = TRUE,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             title = "MCA - Individuals Colored by Age")
+
+
+fviz_mca_ind(res_mca,
+             label = "none",
+             habillage = df_mca$Country,
+             addEllipses = TRUE,
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             title = "MCA - Individuals Colored by Country")
+
+```
+basically this aligns with what we've done. Even so, in country there is not a big difference (european countries are clearly more in the middle but non eurpoean don't seem that centered to the right)
+
+Gender seems clear that males are clearly more prone to having consumed drugs at least once. Age plot is aswell clear, even so being the ellipses quite concentric, there's more deviation to drug use for young age groups.
+```{r}
+
+top_dim1 <- coord_vars[order(abs(coord_vars$`Dim 1`), decreasing = TRUE), ][1:5,]
+top_dim2 <- coord_vars[order(abs(coord_vars$`Dim 2`), decreasing = TRUE), ][1:5, ]
+
+cat("\nTop 10 categories for Dimension 1:\n")
+print(top_dim1)
+
+cat("\nTop 10 categories for Dimension 2:\n")
+print(top_dim2)
+
+```
+It aligns with what we explained.
+
+
+Let's now perform MCA with soft drugs, to interpret new patterns
+
+```{r}
+
+drug_vars=c("Alcohol","Cannabis","Nicotine")
+df_subset <- df[, c(num_vars, soc_vars, drug_vars)]
+df_mca <- df_subset
+
+
+```
+
+```{r}
+
+
+sup_vars <- c("Age","Gender","Country")
+
+
+df_mca <- df_subset
+cat_vars <- df_mca %>%
+  select(where(is.factor)) %>%
+   select(-all_of(soc_vars)) %>%
+
+  select_if(~ nlevels(.) > 1)
+
+mca_data <- bind_cols(cat_vars, df_mca[sup_vars])
+
+quali_sup_indices <- (ncol(cat_vars) + 1):(ncol(cat_vars) + length(sup_vars))
+
+res_mca <- MCA(mca_data, quali.sup = quali_sup_indices, graph = FALSE,level.ventil = 0.01)
+
+```
+
+```{r}
+fviz_screeplot(res_mca, addlabels = TRUE, ggtheme = theme_minimal()) +
+  labs(title = "MCA - Variance Explained by Dimensions")
+
+coord_vars <- as.data.frame(res_mca$var$coord)
+
+eig_vals <- res_mca$eig
+eig_vals$Cumulative <- cumsum(eig_vals[, 2])
+print(eig_vals)
+
+fviz_contrib(res_mca, choice = "var", axes = 1)  # Para Dim 1
+fviz_contrib(res_mca, choice = "var", axes = 2)  # Para Dim 2
+
+
+```
+
+Since there's less variables, intertia is more spread in dimensions
+```{r}
+
+fviz_mca_var(res_mca, repel = TRUE, ggtheme = theme_minimal(),
+             col.var = "contrib",
+             gradient.cols = c("lightblue", "blue", "darkblue"),
+             title = "MCA - Categories")
+
+res_mca$var$contrib
+```
+
+### Sociodemographic Associations with Legal Drug Use
+
+When analyzing the MCA map constructed from legal and commonly used substances — namely alcohol, cannabis, and nicotine — we observe notable associations between recent drug use and sociodemographic characteristics.
+
+In particular, individuals from the **United States**, as well as those aged **18–24**, are projected very close to the category \texttt{Cannabis\_Recent}, indicating a strong alignment with recent cannabis use. This pattern may reflect cultural or legal differences across countries, as cannabis is decriminalized or legal in many parts of the U.S., especially among younger populations. The youngest age group also tends to appear near categories of recent nicotine consumption, reinforcing their tendency toward more frequent engagement with legal substances.
+
+Furthermore, **male** respondents are positioned closer to the high-consumption categories (\texttt{Nicotine\_Last day}, \texttt{Cannabis\_Recent}), in contrast to **females**, who tend to occupy more central or leftward regions of the map, aligning with lower or past usage levels. 
+
+These projections suggest that **country of residence, age, and gender** are all relevant factors in shaping legal drug consumption patterns. Respondents from the USA and young males, in particular, demonstrate a higher likelihood of recent use of nicotine and cannabis, while older age groups and European countries appear more detached from these behaviors.
+
+### Summary of Dimensions (MCA)
+
+- **Dimension 1** contrasts **non-users** vs. **recent users**, especially for cannabis and nicotine. Categories like `Cannabis_Never` and `Nicotine_More than a month ago` oppose `Cannabis_Recent` and `Nicotine_Last day`.
+
+- **Dimension 2** captures **moderate or occasional recent use**, particularly of alcohol and nicotine (`Alcohol_Last month`, `Nicotine_Last month`).
+
+- **Dimension 3** differentiates **very recent use** from **use in the more distant past**, especially regarding alcohol and cannabis (`Alcohol_Last day` vs. `...More than a month ago`).
+
+We won't perform individual plots since there's little categories and it's clear the relationship
+
+
+# Clustering analysis  
+
+```{r elbow_twss, message=FALSE, warning=FALSE, fig.width=6, fig.height=4}
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+df_pca <- df[, cont_vars]
+pca_res <- PCA(df_pca, scale.unit = TRUE, graph = FALSE)
+k_pc   <- which(cumsum(pca_res$eig[,2]) >= 70)[1]
+scores <- pca_res$ind$coord[, 1:k_pc]
+
+# Calcular TWSS para k = 1…10
+set.seed(42)
+wss <- map_dbl(1:10, \(k) kmeans(scores, centers = k, nstart = 25)$tot.withinss)
+
+elbow_df <- tibble(k = 1:10, twss = wss)
+
+ggplot(elbow_df, aes(k, twss)) +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(title = "Elbow method – TWSS vs number of clusters",
+       x = "k (number of clusters)",
+       y = "Total Within-Cluster Sum of Squares") +
+  scale_x_continuous(breaks = 1:10) +
+  theme_minimal()
+```
+
+```{r clustering_on_pca, message=FALSE, warning=FALSE, fig.width=7, fig.height=6}
+
+# 1 ── MATRIZ DE SCORES 
+var_exp <- pca_res$eig[, 2]        
+cum_exp <- cumsum(var_exp)
+k_pc    <- which(cum_exp >= 70)[1]  
+scores  <- pca_res$ind$coord[, 1:k_pc]
+
+cat("Se retienen", k_pc, "PCs  →  var. explicada acumulada =",
+    round(cum_exp[k_pc], 1), "%\n")
+
+# 2 ── DISTANCIA + WARD
+d  <- dist(scores)
+hc <- hclust(d, method = "ward.D2")
+
+# 3 ── ELECCIÓN DE k MEDIANTE SILUETA 
+k_vals <- 2:10
+sil_w  <- sapply(k_vals, \(k) mean(silhouette(cutree(hc, k), d)[, 3]))
+(best_k <- k_vals[which.max(sil_w)])
+
+cat("Mejor k =", best_k,
+    "· silueta media =", round(max(sil_w), 3), "\n")
+
+
+# 4 ── Silhouette para k = 2,3,4 
+d <- dist(scores) 
+fit <- hclust(d, method = "ward.D2") 
+sil_table <- tibble(k = 2:4,
+                    avg_sil = map_dbl(2:4, \(k){
+                      mean(silhouette(cutree(fit, k), d)[,3])
+                    }))
+print(sil_table)
+
+
+# 4 ── ASIGNAR ETIQUETA DE CLÚSTER AL DATAFRAME ORIGINAL
+df_subset$cluster <- factor(cutree(hc, k = best_k))
+
+# 5 ── DENDROGRAMA + CORTE 
+plot(hc, labels = FALSE, hang = -1,
+     main = sprintf("Ward dendrogram  (k = %d)", best_k))
+rect.hclust(hc, k = best_k, border = 2:(best_k + 1))
+
+
+```
+
+Figure displays the Ward dendrogram obtained from the PCA scores. The
+largest fusion height occurs when the algorithm merges three branches
+into two (Δ ≈ 15 units). Cutting the tree immediately below that jump
+yields **three well-separated clusters**; merging further would force
+two distant groups to collapse into one.
+
+The elbow curve still descends appreciably from k=2 to k=3 but flattens
+afterwards, indicating diminishing returns beyond three clusters.
+Likewise, the average silhouette width attains its maximum at k=3
+(0.211). Although all values remain below 0.25—suggesting a moderate
+structure—k=3 offers the best compromise between compactness and
+separation.
+
+Consequently, we retain k=3 for the remainder of the analysis and
+profile these clusters with respect to personality traits and drug-use
+patterns.
+
+```{r refine_kmeans, message=FALSE, warning=FALSE}
+
+
+# scores del PCA y etiquetas Ward (k = 3)
+scores <- pca_res$ind$coord[, 1:k_pc]
+ward_lab <- cutree(fit, k = 3)
+
+# usar centroides Ward como seeds
+centers_init <- aggregate(scores, by = list(ward_lab), FUN = mean)[,-1]
+set.seed(2025)
+km <- kmeans(scores, centers = as.matrix(centers_init), nstart = 1)
+
+# comparar
+cat("Silhouette Ward  :", round(mean(silhouette(ward_lab, dist(scores))[,3]),3), "\n")
+cat("Silhouette k-mean:", round(mean(silhouette(km$cluster, dist(scores))[,3]),3), "\n")
+cat("Adjusted Rand Index (Ward vs k-means) =",
+    round(adjustedRandIndex(ward_lab, km$cluster), 3), "\n")
+
+df_subset$cluster <- factor(km$cluster)   # o ward_lab si prefieres
+```
+
+```{r}
+
+# 1 · Obtener los scores del PCA (ya calculado previamente)
+k_pc <- 3 
+scores <- pca_res$ind$coord[, 1:k_pc]
+
+# 2 · Clustering jerárquico para inicializar (Ward)
+fit <- hclust(dist(scores), method = "ward.D2")
+ward_lab <- cutree(fit, k = 3)
+
+# 3 · Inicialización: usar centroides de Ward como seeds para k-means
+centers_init <- aggregate(scores, by = list(ward_lab), FUN = mean)[, -1]
+
+# 4 · Ejecutar k-means con k = 3
+set.seed(2025)
+km <- kmeans(scores, centers = as.matrix(centers_init), nstart = 1)
+
+# 5 · Evaluar calidad del clustering
+cat("Silhouette Ward  :", round(mean(silhouette(ward_lab, dist(scores))[,3]), 3), "\n")
+cat("Silhouette k-means:", round(mean(silhouette(km$cluster, dist(scores))[,3]), 3), "\n")
+cat("Adjusted Rand Index (Ward vs k-means) =",
+    round(adjustedRandIndex(ward_lab, km$cluster), 3), "\n")
+
+# 6 · Añadir los clústeres al dataframe
+df_subset$cluster <- factor(km$cluster)
+
+# Visualizar los 3 clústeres sobre los scores del PCA
+fviz_cluster(km, 
+             data = scores,
+             geom = "point",
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             main = "K-means clustering (k = 3) sobre scores del PCA")
+mean(silhouette(km$cluster, dist(scores))[, 3])
+```
+
+
+Before interpreting the clusters, it’s helpful to understand the
+psychological relevance of each variable: • Nscore (Neuroticism):
+Reflects emotional instability. Higher scores indicate greater anxiety,
+depression, and emotional reactivity. • Escore (Extraversion): Measures
+sociability and energy. Higher scores denote assertiveness, optimism,
+and a preference for social interaction. • Oscore (Openness): Captures
+openness to novel experiences, creativity, and intellectual curiosity. •
+AScore (Agreeableness): Indicates levels of empathy, altruism, and
+cooperation. • Cscore (Conscientiousness): Reflects self-discipline,
+organization, and reliability. • Impulsivity: Assesses tendencies to act
+on the spur of the moment without considering consequences. • SS
+(Sensation Seeking): Measures the desire for varied, novel, and intense
+experiences.
+
+The following table, combined with the theoretical understanding of each
+trait, allows us to define three distinct psychological profiles
+identified through clustering.
+
+```{r}
+
+profile <- data.frame(
+  Cluster = 1:3,
+  Nscore = c(-0.59, -0.22, 0.75),
+  Escore = c(0.85, -0.19, -0.53),
+  Oscore = c(0.60, -0.65, 0.14),
+  AScore = c(0.25, 0.28, -0.51),
+  Cscore = c(0.34, 0.45, -0.77),
+  Impulsivity = c(0.34, -0.80, 0.53),
+  SS = c(0.51, -0.86, 0.43),
+  n = c(557, 667, 622)
+)
+
+knitr::kable(profile, caption = "Cluster means of psychological traits")
+
+```
+
+### Cluster Profiles
+
+Cluster 1: Sociable, open, emotionally stable. This group is
+characterized by high extraversion and openness, moderate agreeableness
+and conscientiousness, low neuroticism, and moderately high impulsivity
+and sensation seeking. These individuals likely enjoy socializing and
+new experiences while maintaining emotional balance and moderate
+self-control.
+
+Cluster 2: Conventional, structured, low-impulsive. Members of this
+cluster score very low on openness, impulsivity, and sensation seeking,
+while maintaining high levels of conscientiousness and agreeableness.
+They appear disciplined, conformist, and risk-averse. Their low
+extraversion suggests a more introverted lifestyle, and the low
+neuroticism indicates good emotional control.
+
+Cluster 3: Emotionally unstable and impulsive. This profile stands out
+for its high neuroticism, low agreeableness and conscientiousness, and
+high impulsivity and sensation seeking. These individuals are more prone
+to emotional instability, poor impulse control, and may seek stimulation
+as a coping strategy or lifestyle preference.
+
+```{r}
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+
+
+df_pca <- df[, cont_vars]
+
+
+pca_res <- PCA(df_pca, scale.unit = TRUE, graph = FALSE)
+scores <- pca_res$ind$coord[, 1:3]
+
+# K-means con k = 3 (por ejemplo)
+set.seed(2025)
+km <- kmeans(scores, centers = 3, nstart = 25)
+
+cat_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+
+df_subset <- df[, c(cont_vars, cat_vars)]  
+df_subset <- cbind(df_subset, scores)    
+df_subset$cluster <- factor(km$cluster)    
+
+# 2 · perfil de personalidad por clúster
+profile <- df_subset |>
+  group_by(cluster) |>
+  summarise(across(all_of(cont_vars),
+                   list(mean = ~round(mean(.), 2),
+                        sd = ~round(sd(.), 2)),
+                   .names = "{.col}_{.fn}"),
+            n = n())
+
+knitr::kable(profile, caption = "Mean ± SD of personality traits per cluster")
+
+
+radar_df <- df_subset |>
+  group_by(cluster) |>
+  summarise(across(all_of(cont_vars), mean)) |>
+  ungroup()
+
+radar_df <- rbind(rep(2.5, length(cont_vars)),  # max
+                  rep(-2.5, length(cont_vars)), # min
+                  radar_df)
+
+fmsb::radarchart(radar_df,
+                 axistype = 1,
+                 pcol = 2:4,
+                 pfcol = scales::alpha(2:4, .25),
+                 plwd = 2,
+                 cglcol = "grey80")
+legend("topright", legend = paste0("Cluster ", 1:3), col = 2:4, lwd = 2, bty = "n")
+
+chi_tbl <- map_df(cat_vars, \(v){
+  tbl <- table(df_subset$cluster, df_subset[[v]])
+  data.frame(variable  = v,
+             p_value   = round(chisq.test(tbl)$p.value, 4),
+             cramers_V = round(assocstats(tbl)$cramer, 3))
+})
+knitr::kable(chi_tbl, caption = "Chi-square tests (cluster × variable)")
+
+sig_vars <- chi_tbl |> filter(p_value < 0.05) |> pull(variable)
+
+for (v in sig_vars) {
+  print(
+    ggplot(df_subset, aes(x = cluster, fill = !!sym(v))) +
+      geom_bar(position = "fill") +
+      scale_y_continuous(labels = scales::percent) +
+      labs(title = paste("Distribution of", v, "by cluster"),
+           y = "Proportion", fill = v) +
+      theme_minimal()
+  )
+}
+
+sil <- silhouette(km$cluster, dist(scores))
+fviz_silhouette(sil)
+
+```
+
+### Relationship with Drug Use Patterns
+
+To examine how personality profiles relate to substance use, we analyzed the distribution of alcohol, nicotine, cannabis, cocaine, and ecstasy consumption across the clusters. The results are shown in a series of stacked bar charts 
+
+The moost important findings are: 
+• Cluster 1 (sociable and open) shows high alcohol and cannabis use, likely reflecting social or recreational patterns. Ecstasy and cocaine use are present but less dominant than in Cluster 3. 
+• Cluster 2 (structured and reserved) reports the lowest use across all substances, especially in stimulants like cocaine and ecstasy. This aligns with their low sensation-seeking and impulsive traits. 
+• Cluster 3 (impulsive and neurotic) exhibits the highest levels of recent use for most substances, particularly nicotine, cannabis, cocaine, and ecstasy. This pattern matches the psychological profile of impulsivity and emotional instability.
+
+These results suggest that individuals with different personality profiles show significantly different patterns of substance use, a finding consistent with psychological and behavioral research.
+
+### Conclusions (no sé si fa falta fer conclusions d'aquesta part)
+
+The clustering analysis successfully identified three personality profiles based on psychological traits, each associated with distinct patterns of drug use. The clearest finding is that high impulsivity and emotional instability are strongly associated with increased substance consumption, while conformity and low openness act as protective factors.
+
+These insights may be useful for designing targeted interventions or for understanding the psychological underpinnings of addictive behaviors.
+
+### Clustering Based on Raw Personality Trait Scores (Validation Analysis)
+
+To verify that the PCA did not distort the structure of the data, we repeated the clustering analysis using the standardized raw personality trait scores instead of the principal components. This serves as a robustness check for our main findings.
+
+```{r}
+scaled_data <- scale(df[, cont_vars])
+
+
+fit_raw <- hclust(dist(scaled_data), method = "ward.D2")
+ward_raw <- cutree(fit_raw, k = 3)
+centers_raw <- aggregate(scaled_data, by = list(ward_raw), FUN = mean)[, -1]
+
+
+set.seed(2026)
+km_raw <- kmeans(scaled_data, centers = as.matrix(centers_raw), nstart = 1)
+
+cat("Adjusted Rand Index (raw vs PCA):", 
+    round(adjustedRandIndex(km_raw$cluster, km$cluster), 3), "\n")
+
+fviz_cluster(list(data = scores, cluster = km_raw$cluster),
+             geom = "point",
+             ellipse.type = "convex",
+             palette = "jco",
+             ggtheme = theme_minimal(),
+             main = "Clusters from scaled raw data (projected on PCA space)")
+
+sil_raw <- silhouette(km_raw$cluster, dist(scaled_data))
+fviz_silhouette(sil_raw)
+```
+
+A moderate Adjusted Rand Index of 0.459 suggests that the clusters derived from PCA scores and those from scaled raw data are broadly similar, though some individuals are grouped differently. This confirms the general robustness of the clustering structure, while highlighting that dimensionality reduction via PCA introduces slight variations in cluster boundaries.
+
+```{r}
+df_subset$cluster_raw <- factor(km_raw$cluster)
+
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+
+profile_raw <- df_subset |>
+  group_by(cluster_raw) |>
+  summarise(across(all_of(cont_vars),
+                   list(mean = ~round(mean(.), 2),
+                        sd = ~round(sd(.), 2)),
+                   .names = "{.col}_{.fn}"),
+            n = n())
+
+knitr::kable(profile_raw, caption = "Cluster profiles (clustering on scaled raw data)")
+```
+
+
+```{r}
+
+cont_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+cat_vars <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy",
+              "Gender", "Education", "Age", "Country", "Ethnicity")  # puedes ajustar si hace falta
+df[cat_vars] <- lapply(df[cat_vars], as.factor)
+
+pca_res <- PCA(df[, cont_vars], scale.unit = TRUE, ncp = 5, graph = FALSE)
+scores <- pca_res$ind$coord[, 1:3]
+
+
+set.seed(42)
+km <- kmeans(scores, centers = 3, nstart = 25)
+cluster_raw <- cutree(hclust(dist(scores), method = "ward.D2"), k = 3)
+
+
+df_subset <- df[, c(cont_vars, cat_vars)]
+df_subset <- cbind(df_subset,
+                   scores,
+                   cluster = factor(km$cluster),
+                   cluster_raw = factor(cluster_raw))
+
+drug_vars <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy")
+
+chi_tbl_raw <- map_df(drug_vars, \(v){
+  tbl <- table(df_subset$cluster_raw, df_subset[[v]])
+  data.frame(
+    variable  = v,
+    p_value   = round(chisq.test(tbl)$p.value, 4),
+    cramers_V = round(assocstats(tbl)$cramer, 3)
+  )
+})
+
+knitr::kable(chi_tbl_raw, caption = "Chi-square test (cluster_raw × drug use)")
+```
+
+
+```{r}
+sig_vars_raw <- chi_tbl_raw |> filter(p_value < .05) |> pull(variable)
+
+for (v in sig_vars_raw) {
+  print(
+    ggplot(df_subset, aes(x = cluster_raw, fill = !!sym(v))) +
+      geom_bar(position = "fill") +
+      scale_y_continuous(labels = scales::percent) +
+      labs(title = paste("Distribution of", v, "by raw-cluster"),
+           y = "Proportion", fill = v) +
+      theme_minimal()
+  )
+}
+```
+
+The same clustering analysis was replicated using the raw personality trait scores (after standardization), instead of using PCA scores. The results remain largely consistent: the clusters show similar internal profiles and almost identical distributions of drug use (see bar plots above). This suggests that dimensionality reduction via PCA has not distorted the underlying structure of the data, and confirms the robustness of the findings.
+
+# Dsicriminant analysis ... 
+
+
+
+
+
+```{r}
+# Define las variables de drogas seleccionadas
+selected_drugs <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy", 
+                    "Amphet", "Heroin","Caff")
+
+# Variables sociodemográficas
+demo_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+# Variables numéricas (las busca automáticamente)
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+# Crea el nuevo dataframe con todo lo que quieres
+df_subset <- df[, c(num_vars, demo_vars, selected_drugs)]
+
+# Mira el resultado
+str(df_subset)
+summary(df_subset)
+```
+
+
+
+DISCRIMINANT ANALYSIS
+
+
+
+
+```{r}
+df <- read_csv("Drug_Consumption.csv")
+
+df$ID <- NULL
+
+df[] <- lapply(df, function(x) if(is.character(x)) as.factor(x) else x)
+
+
+```
+
+
+
+```{r}
+
+df <- df[df$Semer == "CL0", ]
+
+df$Semer <- NULL
+```
+
+
+```{r}
+drug_vars <- c("Alcohol", "Amphet", "Amyl", "Benzos", "Caff", "Cannabis", "Choc", "Coke", "Crack",
+               "Ecstasy", "Heroin", "Ketamine", "Legalh", "LSD", "Meth", "Mushrooms", 
+               "Nicotine", "VSA")
+
+
+frequent_use <- c("Caff", "Alcohol", "Nicotine")
+
+recode_use <- function(value, frequent = FALSE) {
+  if (is.na(value) || !grepl("^CL[0-6]$", value)) {
+    return(NA_character_)
+  }
+  cl <- as.integer(substr(value, 3, 3))
+  if (frequent) {
+    if (cl == 6) {
+      return("Last day")
+    } else if (cl %in% c(4, 5)) {
+      return("Last month")
+    } else {
+      return("More than a month ago")
+    }
+  } else {
+    if (cl %in% c(4, 5, 6)) {
+      return("Recent")
+    } else if (cl == 0) {
+      return("Never")
+    } else {
+      return("More than a month ago")
+    }
+  }
+}
+
+for (var in drug_vars) {
+  df[[var]] <- as.factor(vapply(df[[var]], recode_use, character(1), frequent = (var %in% frequent_use)))
+}
+
+str(df)
+```
+
+```{r}
+selected_drugs <- c("Alcohol", "Nicotine", "Cannabis", "Coke", "Ecstasy", 
+                    "Amphet", "Heroin","Caff")
+
+demo_vars <- c("Gender", "Education", "Age", "Country", "Ethnicity")
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+
+df_subset <- df[, c(num_vars, demo_vars, selected_drugs)]
+
+
+str(df_subset)
+summary(df_subset)
+```
+
+Of all the substances, we consider chocolate, alcohol, nicotine and caffeine of frequent consume, and call all the other ones hard drugs. During this section we will say that someone falls into the category of DrugUser if they have recently taken any hard drug. Our objective is to obtain a model that determines whether or not someone is a DrugUser just looking at their personality traits. 
+
+```{r}
+selected_drugs <- c("Alcohol", "Amphet", "Amyl", "Benzos", "Caff", "Cannabis", "Choc", "Coke", "Crack", "Ecstasy", "Heroin", "Ketamine", "Legalh", "LSD", "Meth", "Mushrooms", "Nicotine", "VSA")
+
+df_subset_discanalysis <- df[, c(num_vars, demo_vars, selected_drugs)]
+
+df_subset_discanalysis$DrugUser <- with(df_subset_discanalysis,
+                                        ifelse(Heroin == "Recent" |
+                                               Amphet == "Recent" |
+                                               Amyl == "Recent" |
+                                               Benzos == "Recent" |
+                                               Cannabis == "Recent" |
+                                               Crack == "Recent" |
+                                               Ecstasy == "Recent" |
+                                               Legalh == "Recent" |
+                                               LSD == "Recent" |
+                                               Meth == "Recent" |
+                                               Mushrooms == "Recent" |
+                                               VSA == "Recent" |
+                                               Ketamine == "Recent" | 
+                                               Coke == "Recent", "Yes", "No"))
+df_subset_discanalysis$DrugUser <- as.factor(df_subset_discanalysis$DrugUser)
+
+# Total values
+table(df_subset_discanalysis$DrugUser)
+```
+
+
+Check that around halve the people fall into the YES category, and halve into the NO category. This is important, as if it wasn't the case, the prediction would probably be viased, obtaining a useless model.
+
+
+
+Check normality and homogeneity
+
+```{r}
+# Check normality
+for (var in names(df_subset_discanalysis)[sapply(df_subset_discanalysis, is.numeric)]) {
+  print(var)
+  print(shapiro.test(df_subset_discanalysis[[var]]))
+  qqnorm(df_subset_discanalysis[[var]], main = var)
+  qqline(df_subset_discanalysis[[var]])
+  hist(df_subset_discanalysis[[var]], main = var)
+}
+
+# Check Homogeneity 
+boxM(df_subset_discanalysis[, num_vars], df_subset_discanalysis$DrugUser)
+```
+
+The Box M-test tells us, with a lot of confidence, that the covariance matrices of the variables are not the same. That is, we cannot apply LDA, so will be applying QDA.
+
+QDA
+
+```{r}
+
+### Fitting QDA Model ###
+
+qda_model <- qda(DrugUser ~ ., data = df_subset_discanalysis[, c(num_vars, "DrugUser")])
+qda_model
+
+# Prior probabilities
+qda_model$prior
+
+# Predicting groups
+qda_pred <- predict(qda_model)
+names(qda_pred)
+
+# Observed vs. Predicted Table
+tab <- table(Actual = df_subset_discanalysis$DrugUser, Predicted = qda_pred$class)
+tab
+
+# CRR
+classrate <- sum(diag(tab)) / sum(tab)
+classrate
+
+# Total CCR as proportion
+sum(diag(prop.table(tab)))
+
+# CCR across groups
+diag(prop.table(tab, 1))
+
+# Prediction Accuracy based on priors: p1^2 + p2^2
+pa <- qda_model$prior[1]^2 + qda_model$prior[2]^2
+pa
+
+# Comparison of Original vs. Predicted Groups
+comp <- cbind(Actual = df_subset_discanalysis$DrugUser, Predicted = qda_pred$class)
+head(comp)
+
+
+### Stepwise Classification (QDA) ###
+
+
+# Backward Stepwise Feature Selection for QDA
+qstepwise_model <- stepclass(df_subset_discanalysis[, num_vars], 
+                             df_subset_discanalysis$DrugUser,
+                             method = "qda", 
+                             direction = "backward", 
+                             criterion = "CR")
+
+summary(qstepwise_model)
+qstepwise_model$process
+qstepwise_model$model
+qstepwise_model$result.pm
+
+# Forward Stepwise Feature Selection for QDA
+qstepwise_model_fwrd <- stepclass(df_subset_discanalysis[, num_vars], 
+                                  df_subset_discanalysis$DrugUser,
+                                  method = "qda", 
+                                  direction = "forward", 
+                                  criterion = "CR")
+
+summary(qstepwise_model_fwrd)
+qstepwise_model_fwrd$process
+qstepwise_model_fwrd$model
+qstepwise_model_fwrd$result.pm
+
+
+### Visualization of QDA using PCA ###
+
+
+# 12. Visualize predictions in PCA-reduced space
+pca_data <- prcomp(df_subset_discanalysis[, num_vars], scale. = TRUE)
+pca_df <- as.data.frame(pca_data$x[, 1:2])
+pca_df$Predicted <- qda_pred$class
+
+# Plot using ggplot2
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Predicted)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "QDA Classification (PCA-reduced space)", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+
+
+### QDA vs Random Model ###
+
+n <- sum(tab)
+k <- ncol(tab)
+ny <- sum(diag(tab)) / k
+
+# Q-statistic formula
+Qqda <- ((n - ny * k)^2) / (n * (k - 1))
+Qqda
+
+# Interpretation
+if (Qqda > 3.84) {
+  message("✅ QDA model is significantly better than random classification.")
+} else {
+  message("⚠️ QDA model is NOT significantly better than random classification.")
+}
+```
+
+Check that the stepwise classification tells us, in both backward and forward cases, that SS is the most significative variable. Also see how in the backwards case, the second last variable to be deleted is Impulsive. This makes sense as Impulsive and SS are highly correlated, so SS being a good predictor strongly indicates that Impulsive also is.
+
+NAIVE BAYES
+
+Chi-Squared test
+
+```{r}
+# List of your discrete (categorical) predictor variables
+cat_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")  # Example, replace with your actual variable names
+
+# Run chi-squared test for each one against the class label
+for (var in cat_vars) {
+  cat("Chi-squared test for:", var, "\n")
+  print(chisq.test(table(df_subset_discanalysis[[var]], df_subset_discanalysis$DrugUser)))
+  cat("\n-------------------------------\n")
+}
+```
+
+All the p-values are <0.05, which implies that we can apply Naive Bayes.
+
+
+```{r}
+
+### Naive Bayes on the entire dataset ###
+
+nb_model_full <- naiveBayes(DrugUser ~ ., data = df_subset_discanalysis[, c(num_vars, "DrugUser")])
+nb_model_full
+
+nb_class_full <- predict(nb_model_full, df_subset_discanalysis)
+
+# Confusion matrix 
+tab_nb_full <- table(Predicted = nb_class_full, Actual = df_subset_discanalysis$DrugUser)
+print(tab_nb_full)
+
+# Accuracy 
+mean(nb_class_full == df_subset_discanalysis$DrugUser)
+
+# Posterior probabilities
+nb_probs_full <- predict(nb_model_full, df_subset_discanalysis, type = "raw")
+head(nb_probs_full, 10)
+
+
+
+### Validation ###
+
+# Split the data into training and test sets
+set.seed(123)  # For reproducibility
+split <- sample.split(df_subset_discanalysis$DrugUser, SplitRatio = 0.67)
+
+train_data <- subset(df_subset_discanalysis, split == TRUE)
+test_data <- subset(df_subset_discanalysis, split == FALSE)
+
+# Fit Naive Bayes model on training data
+nb_model_train <- naiveBayes(DrugUser ~ ., data = train_data[, c(num_vars, "DrugUser")])
+nb_model_train
+
+# Predict on test data
+nb_pred_test <- predict(nb_model_train, newdata = test_data)
+
+# Confusion matrix on test set
+conf_matrix <- table(Actual = test_data$DrugUser, Predicted = nb_pred_test)
+print(conf_matrix)
+
+# Accuracy on test set
+mean(nb_pred_test == test_data$DrugUser)
+
+
+
+### Naive Bayes Model vs Random Model ###
+
+n <- sum(conf_matrix)
+k <- ncol(conf_matrix)
+ny <- sum(diag(conf_matrix)) / k
+
+# Q-statistic
+Qnb <- ((n - ny * k)^2) / (n * (k - 1))
+Qnb
+
+if (Qnb > 3.84) {
+  message("✅ The model performs significantly better than random.")
+} else {
+  message("⚠️ The model does NOT perform significantly better than random.")
+}
+```
+
+
+
+HOTELLING T^2 TEST
+
+We will be using as groups the same as in the Discriminant Analysis section. Group A will be the people classified as DrugUsers, and Group B the rest. Our objective is to check if there is a significant difference between groups.
+
+The assumption for this test is that variables follow normality, and that their covariance matrices are the same. We've already seen in the Discriminant analysis section that covariance matrices are not the same, so we will be performing the version of the test where variances are not the same: with chi-square approximation:
+
+```{r}
+GA <- subset(df_subset_discanalysis, DrugUser == "Yes")[, num_vars]
+GB <- subset(df_subset_discanalysis, DrugUser == "No")[, num_vars]
+
+# Recall dimensions
+dim(GA)
+dim(GB)
+
+# Hotelling’s T^2 test, Unequal Variance Case
+T2chi <- HotellingsT2Test(GA, GB, test = "chi")
+
+print(T2chi)
+
+# Test statistic
+T2_statistic <- T2chi$statistic
+cat("Hotelling T^2 (Unequal Variance Case) Statistic:", T2_statistic, "\n")
+
+# Critical Chi-square value
+df <- ncol(GA)
+chi_critical <- qchisq(0.95, df)
+
+# Compare statistic vs. critical value
+if (T2_statistic > chi_critical) {
+  cat("✅ Reject H0: There is a significant difference between groups.\n")
+} else {
+  cat("❌ Fail to reject H0: No significant difference detected.\n")
+}
+```
+
+MANOVA
+
+
+The objective of the MANOVA is to check if the characteristics of several (> $2$) groups are significantly different. In order to do this, we will group people depending on which hard drug they are taking. We will group drugs in $4$ categories: 1. Stimulants -> Amphet, Coke, Meth, Ecstasy; 2. Hallucinogenous -> LSD, Mushrooms, Ketamine, Legalh; 3. Depressants -> Benzos, Heroin, Amyls; and 4. Cannabis.
+
+```{r}
+
+stimulants <- c("Amphet", "Coke", "Meth", "Ecstasy")
+hallucinogens <- c("LSD", "Mushrooms", "Ketamine", "Legalh")
+depressants <- c("Benzos", "Heroin", "Amyl")
+cannabinoids <- c("Cannabis")
+
+# Create DrugCategory 
+df_subset_discanalysis <- df_subset_discanalysis %>%
+  dplyr::mutate(
+    DrugCategory = dplyr::case_when(
+      rowSums(dplyr::across(all_of(stimulants), ~ . == "Recent")) > 0 ~ "Stimulant",
+      rowSums(dplyr::across(all_of(hallucinogens), ~ . == "Recent")) > 0 ~ "Hallucinogen",
+      rowSums(dplyr::across(all_of(depressants), ~ . == "Recent")) > 0 ~ "Depressant",
+      rowSums(dplyr::across(all_of(cannabinoids), ~ . == "Recent")) > 0 ~ "Cannabinoid",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Convert to factor
+df_subset_discanalysis$DrugCategory <- as.factor(df_subset_discanalysis$DrugCategory)
+
+# Check counts
+table(df_subset_discanalysis$DrugCategory)
+
+# Recall which are our 7 numerical variables
+personality_vars <- c("Nscore", "Escore", "Oscore", "AScore", "Cscore", "Impulsive", "SS")
+
+# Delete NA's
+df_drug_cats <- df_subset_discanalysis %>%
+  dplyr::filter(!is.na(DrugCategory)) %>%
+  dplyr::select(DrugCategory, dplyr::all_of(personality_vars)) %>%
+  na.omit()
+
+# Run MANOVA
+manova_model <- manova(as.matrix(df_drug_cats[, personality_vars]) ~ DrugCategory, data = df_drug_cats)
+summary(manova_model)
+summary.aov(manova_model)
+
+# Tukey post-hoc tests
+TukeyHSD(aov(Nscore ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(Escore ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(Oscore ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(AScore ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(Cscore ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(Impulsive ~ DrugCategory, data = df_drug_cats))
+TukeyHSD(aov(SS ~ DrugCategory, data = df_drug_cats))
+```
+
+Basically the answer is NO, the means are not the same. The personality trait Nscore is the one that is more different amongst categories: It is highest in Depressant drugs, and lowest in Cannabis (this makes a lot of sense). 
